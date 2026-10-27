@@ -2,6 +2,9 @@
   "listen": ":8080",
   "admin": ":9090",
   "log_level": "info",
+  "api_keys": [
+    { "name": "demo", "key": "demo-key-0123456789" }
+  ],
   "routes": [
     {
       "name": "echo",

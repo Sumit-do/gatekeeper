@@ -8,6 +8,7 @@ package proxy
 
 import (
 	"context"
+	"crypto/sha256"
 	"errors"
 	"fmt"
 	"log/slog"
@@ -29,9 +30,20 @@ import (
 	"github.com/sumit-do/gatekeeper/internal/ratelimit"
 )
 
-// APIKeyHeader is the request header used as the rate-limit client key when
-// present. Requests without it are keyed by client IP.
+// APIKeyHeader carries a client's API key. It is honoured only when the
+// configuration lists api_keys; otherwise clients are keyed by IP so that a
+// caller cannot dodge rate limits by inventing keys.
 const APIKeyHeader = "X-API-Key"
+
+// ClientHeader is set on upstream requests to the name of the authenticated
+// API-key client. Any value sent by the caller is removed first.
+const ClientHeader = "X-Gatekeeper-Client"
+
+// keyDigest is the SHA-256 of an API key. Keys are looked up by digest so the
+// lookup time does not depend on how much of a guessed key is correct.
+type keyDigest [sha256.Size]byte
+
+type clientCtxKey struct{}
 
 // UnmatchedRoute is the metrics label used for requests that match no route.
 const UnmatchedRoute = "unmatched"
@@ -57,12 +69,14 @@ type Route struct {
 	Prefix      string
 	StripPrefix bool
 
-	upstreams []*Upstream
-	next      atomic.Uint64
-	limiter   *ratelimit.Limiter
-	metrics   *metrics.Registry
-	logger    *slog.Logger
-	handler   http.Handler
+	requireKey bool
+	keys       map[keyDigest]string // digest -> client name; shared, read-only
+	upstreams  []*Upstream
+	next       atomic.Uint64
+	limiter    *ratelimit.Limiter
+	metrics    *metrics.Registry
+	logger     *slog.Logger
+	handler    http.Handler
 }
 
 // Upstreams returns a copy of the route's upstream list.
@@ -92,10 +106,15 @@ func New(cfg *config.Config, opts Options) (*Router, error) {
 		opts.Now = time.Now
 	}
 
+	keys := make(map[keyDigest]string, len(cfg.APIKeys))
+	for _, k := range cfg.APIKeys {
+		keys[sha256.Sum256([]byte(k.Key))] = k.Name
+	}
+
 	ctx, cancel := context.WithCancel(context.Background())
 	r := &Router{metrics: opts.Metrics, cancel: cancel}
 	for _, rc := range cfg.Routes {
-		rt, err := newRoute(ctx, rc, opts)
+		rt, err := newRoute(ctx, rc, keys, opts)
 		if err != nil {
 			cancel()
 			return nil, err
@@ -151,11 +170,13 @@ func (r *Router) Close() {
 	r.cancel()
 }
 
-func newRoute(ctx context.Context, rc config.Route, opts Options) (*Route, error) {
+func newRoute(ctx context.Context, rc config.Route, keys map[keyDigest]string, opts Options) (*Route, error) {
 	rt := &Route{
 		Name:        rc.Name,
 		Prefix:      rc.PathPrefix,
 		StripPrefix: rc.StripPrefix,
+		requireKey:  rc.RequireAPIKey,
+		keys:        keys,
 		metrics:     opts.Metrics,
 		logger:      opts.Logger.With("route", rc.Name),
 	}
@@ -207,8 +228,18 @@ func (rt *Route) matches(path string) bool {
 }
 
 func (rt *Route) serve(w http.ResponseWriter, r *http.Request) {
+	key, client, reject := rt.identify(r)
+	if reject != "" {
+		w.Header().Set("WWW-Authenticate", `ApiKey header="`+APIKeyHeader+`"`)
+		http.Error(w, reject, http.StatusUnauthorized)
+		return
+	}
+	if client != "" {
+		r = r.WithContext(context.WithValue(r.Context(), clientCtxKey{}, client))
+	}
+
 	if rt.limiter != nil {
-		if ok, retry := rt.limiter.Allow(ClientKey(r)); !ok {
+		if ok, retry := rt.limiter.Allow(key); !ok {
 			secs := int(math.Ceil(retry.Seconds()))
 			if secs < 1 {
 				secs = 1
@@ -254,6 +285,13 @@ func (rt *Route) newReverseProxy(up *Upstream, transport http.RoundTripper) *htt
 				pr.Out.URL.Path = stripPath(pr.In.URL.Path, rt.Prefix)
 				pr.Out.URL.RawPath = ""
 			}
+			pr.Out.Header.Del(ClientHeader)
+			if client, ok := pr.In.Context().Value(clientCtxKey{}).(string); ok {
+				// The gateway consumed the credential; upstreams get the
+				// verified identity instead of the secret.
+				pr.Out.Header.Del(APIKeyHeader)
+				pr.Out.Header.Set(ClientHeader, client)
+			}
 			pr.SetURL(target)
 			pr.SetXForwarded()
 		},
@@ -282,17 +320,36 @@ func (rt *Route) newReverseProxy(up *Upstream, transport http.RoundTripper) *htt
 	}
 }
 
-// ClientKey derives the rate-limit key for a request: the X-API-Key header
-// when present, otherwise the client IP without its port.
-func ClientKey(r *http.Request) string {
-	if k := r.Header.Get(APIKeyHeader); k != "" {
-		return "key:" + k
+// identify authenticates the caller. It returns the rate-limit key and, for
+// API-key clients, the configured client name. A non-empty reject message
+// means the request must be refused with 401.
+//
+// The X-API-Key header only counts when api_keys are configured, and then it
+// must match one of them: an unknown key is rejected rather than treated as a
+// new client, otherwise anyone could bypass rate limiting by sending random
+// keys.
+func (rt *Route) identify(r *http.Request) (key, client, reject string) {
+	if h := r.Header.Get(APIKeyHeader); h != "" && len(rt.keys) > 0 {
+		name, ok := rt.keys[sha256.Sum256([]byte(h))]
+		if !ok {
+			return "", "", "invalid API key"
+		}
+		return "key:" + name, name, ""
 	}
+	if rt.requireKey {
+		return "", "", "missing API key"
+	}
+	return "ip:" + clientIP(r), "", ""
+}
+
+// clientIP returns the connection's remote IP without its port.
+// X-Forwarded-For is deliberately ignored because clients can forge it.
+func clientIP(r *http.Request) string {
 	host, _, err := net.SplitHostPort(r.RemoteAddr)
 	if err != nil {
-		host = r.RemoteAddr
+		return r.RemoteAddr
 	}
-	return "ip:" + host
+	return host
 }
 
 // stripPath removes prefix from path, always leaving a leading slash.

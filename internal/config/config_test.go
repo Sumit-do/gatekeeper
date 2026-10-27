@@ -87,6 +87,11 @@ func TestParseErrors(t *testing.T) {
 		{"bad duration", route(`,"timeout":"soon"`), "invalid duration"},
 		{"negative cooldown", route(`,"circuit_breaker":{"cooldown":"-5s"}`), "cooldown must be positive"},
 		{"same listen and admin", `{"listen":":1","admin":":1","routes":[{"path_prefix":"/","upstreams":["http://x"]}]}`, "must differ"},
+		{"require key without keys", route(`,"require_api_key":true`), "no api_keys are configured"},
+		{"short api key", `{"api_keys":[{"name":"a","key":"short"}],"routes":[{"path_prefix":"/","upstreams":["http://x"]}]}`, "at least 16 characters"},
+		{"unnamed api key", `{"api_keys":[{"key":"0123456789abcdef"}],"routes":[{"path_prefix":"/","upstreams":["http://x"]}]}`, "name must not be empty"},
+		{"duplicate api key name", `{"api_keys":[{"name":"a","key":"0123456789abcdef"},{"name":"a","key":"fedcba9876543210"}],"routes":[{"path_prefix":"/","upstreams":["http://x"]}]}`, "duplicate name"},
+		{"reused api key secret", `{"api_keys":[{"name":"a","key":"0123456789abcdef"},{"name":"b","key":"0123456789abcdef"}],"routes":[{"path_prefix":"/","upstreams":["http://x"]}]}`, "already used"},
 		{"bad log level", `{"log_level":"loud","routes":[{"path_prefix":"/","upstreams":["http://x"]}]}`, "unknown level"},
 	}
 	for _, tc := range cases {

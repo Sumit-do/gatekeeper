@@ -69,7 +69,11 @@ type harness struct {
 
 func newHarness(t *testing.T, clk *fakeClock, routes ...config.Route) *harness {
 	t.Helper()
-	cfg := &config.Config{Routes: routes}
+	return newHarnessConfig(t, clk, &config.Config{Routes: routes})
+}
+
+func newHarnessConfig(t *testing.T, clk *fakeClock, cfg *config.Config) *harness {
+	t.Helper()
 	cfg.ApplyDefaults()
 	if err := cfg.Validate(); err != nil {
 		t.Fatalf("test config invalid: %v", err)
@@ -181,14 +185,20 @@ func TestRateLimitReturns429WithRetryAfter(t *testing.T) {
 	a, _ := echoUpstream(t, "a")
 	r := route("/api", a.URL)
 	r.RateLimit = &config.RateLimit{RPS: 1, Burst: 2}
-	h := newHarness(t, newClock(), r)
+	h := newHarnessConfig(t, newClock(), &config.Config{
+		Routes: []config.Route{r},
+		APIKeys: []config.APIKey{
+			{Name: "alice", Key: aliceKey},
+			{Name: "bob", Key: bobKey},
+		},
+	})
 
 	for i := 0; i < 2; i++ {
-		if resp := h.get("/api", APIKeyHeader, "alice"); resp.StatusCode != http.StatusOK {
+		if resp := h.get("/api", APIKeyHeader, aliceKey); resp.StatusCode != http.StatusOK {
 			t.Fatalf("request %d: status = %d, want 200", i+1, resp.StatusCode)
 		}
 	}
-	resp := h.get("/api", APIKeyHeader, "alice")
+	resp := h.get("/api", APIKeyHeader, aliceKey)
 	if resp.StatusCode != http.StatusTooManyRequests {
 		t.Fatalf("status = %d, want 429", resp.StatusCode)
 	}
@@ -196,7 +206,7 @@ func TestRateLimitReturns429WithRetryAfter(t *testing.T) {
 		t.Fatalf("Retry-After = %q, want \"1\"", ra)
 	}
 	// A different API key has its own bucket.
-	if resp := h.get("/api", APIKeyHeader, "bob"); resp.StatusCode != http.StatusOK {
+	if resp := h.get("/api", APIKeyHeader, bobKey); resp.StatusCode != http.StatusOK {
 		t.Fatalf("other key: status = %d, want 200", resp.StatusCode)
 	}
 	// Requests without a key fall back to the client IP bucket.
@@ -356,20 +366,122 @@ func TestLongestPrefixWins(t *testing.T) {
 	}
 }
 
-func TestClientKey(t *testing.T) {
+func TestClientIP(t *testing.T) {
 	req := httptest.NewRequest("GET", "/", nil)
 	req.RemoteAddr = "10.1.2.3:5555"
-	if got := ClientKey(req); got != "ip:10.1.2.3" {
-		t.Fatalf("ClientKey = %q", got)
+	req.Header.Set("X-Forwarded-For", "6.6.6.6")
+	if got := clientIP(req); got != "10.1.2.3" {
+		t.Fatalf("clientIP = %q, want 10.1.2.3 (X-Forwarded-For must be ignored)", got)
 	}
-	req.Header.Set(APIKeyHeader, "secret")
-	if got := ClientKey(req); got != "key:secret" {
-		t.Fatalf("ClientKey = %q", got)
-	}
-	req.Header.Del(APIKeyHeader)
 	req.RemoteAddr = "weird"
-	if got := ClientKey(req); got != "ip:weird" {
-		t.Fatalf("ClientKey = %q", got)
+	if got := clientIP(req); got != "weird" {
+		t.Fatalf("clientIP = %q", got)
+	}
+}
+
+const (
+	aliceKey = "alice-0123456789abcdef"
+	bobKey   = "bob-0123456789abcdef"
+)
+
+// headerEcho reports the identity headers it received back as response
+// headers so tests can see what the gateway forwarded.
+func headerEcho(t *testing.T) *httptest.Server {
+	t.Helper()
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		w.Header().Set("Got-Client", r.Header.Get(ClientHeader))
+		w.Header().Set("Got-Api-Key", r.Header.Get(APIKeyHeader))
+		w.WriteHeader(http.StatusOK)
+	}))
+	t.Cleanup(srv.Close)
+	return srv
+}
+
+func TestRandomAPIKeysCannotBypassRateLimit(t *testing.T) {
+	up := headerEcho(t)
+	rc := route("/", up.URL)
+	rc.RateLimit = &config.RateLimit{RPS: 1, Burst: 1}
+	h := newHarness(t, newClock(), rc) // no api_keys configured
+
+	if got := h.get("/", APIKeyHeader, "made-up-1").StatusCode; got != http.StatusOK {
+		t.Fatalf("first request = %d, want 200", got)
+	}
+	resp := h.get("/", APIKeyHeader, "made-up-2")
+	if resp.StatusCode != http.StatusTooManyRequests {
+		t.Fatalf("second request with a new invented key = %d, want 429", resp.StatusCode)
+	}
+}
+
+func TestAPIKeyAuthentication(t *testing.T) {
+	up := headerEcho(t)
+	rc := route("/", up.URL)
+	rc.RequireAPIKey = true
+	h := newHarnessConfig(t, nil, &config.Config{
+		Routes:  []config.Route{rc},
+		APIKeys: []config.APIKey{{Name: "alice", Key: aliceKey}},
+	})
+
+	missing := h.get("/")
+	if missing.StatusCode != http.StatusUnauthorized {
+		t.Fatalf("missing key = %d, want 401", missing.StatusCode)
+	}
+	if missing.Header.Get("WWW-Authenticate") == "" {
+		t.Fatal("401 without WWW-Authenticate header")
+	}
+	if got := h.get("/", APIKeyHeader, "wrong-0123456789abcdef").StatusCode; got != http.StatusUnauthorized {
+		t.Fatalf("wrong key = %d, want 401", got)
+	}
+
+	ok := h.get("/", APIKeyHeader, aliceKey, ClientHeader, "spoofed-admin")
+	if ok.StatusCode != http.StatusOK {
+		t.Fatalf("valid key = %d, want 200", ok.StatusCode)
+	}
+	if got := ok.Header.Get("Got-Client"); got != "alice" {
+		t.Fatalf("upstream saw %s = %q, want alice", ClientHeader, got)
+	}
+	if got := ok.Header.Get("Got-Api-Key"); got != "" {
+		t.Fatalf("upstream received the raw API key %q; it should be stripped", got)
+	}
+	if !strings.Contains(h.metricsText(), `status="401"`) {
+		t.Fatal("401 responses missing from metrics")
+	}
+}
+
+func TestSpoofedClientHeaderStrippedWithoutKey(t *testing.T) {
+	up := headerEcho(t)
+	h := newHarnessConfig(t, nil, &config.Config{
+		Routes:  []config.Route{route("/", up.URL)},
+		APIKeys: []config.APIKey{{Name: "alice", Key: aliceKey}},
+	})
+	resp := h.get("/", ClientHeader, "alice")
+	if resp.StatusCode != http.StatusOK {
+		t.Fatalf("anonymous request on optional-key route = %d, want 200", resp.StatusCode)
+	}
+	if got := resp.Header.Get("Got-Client"); got != "" {
+		t.Fatalf("caller-supplied %s reached upstream as %q", ClientHeader, got)
+	}
+}
+
+func TestEachAPIKeyGetsItsOwnBucket(t *testing.T) {
+	up := headerEcho(t)
+	rc := route("/", up.URL)
+	rc.RateLimit = &config.RateLimit{RPS: 1, Burst: 1}
+	h := newHarnessConfig(t, newClock(), &config.Config{
+		Routes: []config.Route{rc},
+		APIKeys: []config.APIKey{
+			{Name: "alice", Key: aliceKey},
+			{Name: "bob", Key: bobKey},
+		},
+	})
+
+	if got := h.get("/", APIKeyHeader, aliceKey).StatusCode; got != http.StatusOK {
+		t.Fatalf("alice #1 = %d, want 200", got)
+	}
+	if got := h.get("/", APIKeyHeader, aliceKey).StatusCode; got != http.StatusTooManyRequests {
+		t.Fatalf("alice #2 = %d, want 429", got)
+	}
+	if got := h.get("/", APIKeyHeader, bobKey).StatusCode; got != http.StatusOK {
+		t.Fatalf("bob #1 = %d, want 200 (separate bucket)", got)
 	}
 }
 
