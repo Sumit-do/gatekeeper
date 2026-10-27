@@ -1,0 +1,16 @@
+{
+  "listen": ":8080",
+  "admin": ":9090",
+  "log_level": "info",
+  "routes": [
+    {
+      "name": "echo",
+      "path_prefix": "/echo",
+      "upstreams": ["http://echo1:8081", "http://echo2:8081"],
+      "strip_prefix": true,
+      "rate_limit": { "rps": 5, "burst": 10 },
+      "timeout": "5s",
+      "circuit_breaker": { "failure_threshold": 3, "cooldown": "20s" }
+    }
+  ]
+}
