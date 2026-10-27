@@ -1,15 +1,17 @@
 # gatekeeper
 
+[![CI](https://github.com/sumit-do/gatekeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/sumit-do/gatekeeper/actions/workflows/ci.yml)
+[![Release](https://img.shields.io/github/v/release/sumit-do/gatekeeper?sort=semver)](https://github.com/sumit-do/gatekeeper/releases/latest)
+[![Go Reference](https://pkg.go.dev/badge/github.com/sumit-do/gatekeeper.svg)](https://pkg.go.dev/github.com/sumit-do/gatekeeper)
+![Go](https://img.shields.io/badge/go-1.24+-00ADD8?logo=go&logoColor=white)
+[![License: MIT](https://img.shields.io/badge/license-MIT-green)](LICENSE)
+
 A lightweight HTTP API gateway and reverse proxy written in Go with **zero
 third-party dependencies**. It sits in front of your services and gives you
 prefix-based routing, round-robin load balancing, per-upstream circuit
 breakers, per-client token-bucket rate limiting, request IDs, structured JSON
 logs, Prometheus metrics, hot config reload and graceful shutdown — in one
 static binary.
-
-[![CI](https://github.com/sumit-do/gatekeeper/actions/workflows/ci.yml/badge.svg)](https://github.com/sumit-do/gatekeeper/actions/workflows/ci.yml)
-![Go](https://img.shields.io/badge/go-1.24-00ADD8)
-![License](https://img.shields.io/badge/license-MIT-green)
 
 ## Features
 
@@ -85,6 +87,16 @@ internal/metrics/    hand-rolled Prometheus text exposition
 examples/echo/       tiny upstream used by docker-compose and demos
 ```
 
+## Install
+
+Download a prebuilt binary for Linux, macOS or Windows from the
+[latest release](https://github.com/sumit-do/gatekeeper/releases/latest), or build from source:
+
+```sh
+go install github.com/sumit-do/gatekeeper/cmd/gatekeeper@latest
+gatekeeper -version
+```
+
 ## Quick start
 
 Requires Go 1.24+.
@@ -147,6 +159,7 @@ strings accepted by `time.ParseDuration` (`"500ms"`, `"30s"`, `"5m"`).
 | `log_level`        | string   | `info`   | `debug`, `info`, `warn` or `error`.                             |
 | `shutdown_timeout` | duration | `10s`    | How long in-flight requests may drain on SIGINT/SIGTERM.       |
 | `routes`           | array    | required | At least one route.                                             |
+| `api_keys`         | array    | none     | Accepted `X-API-Key` credentials, each `{"name", "key"}`; keys need 16+ characters. When empty, the header is ignored and clients are keyed by IP. |
 
 ### Route
 
@@ -156,6 +169,7 @@ strings accepted by `time.ParseDuration` (`"500ms"`, `"30s"`, `"5m"`).
 | `path_prefix`                      | string   | required      | Must start with `/`. Matches on segment boundaries (`/api` ≠ `/apix`).     |
 | `upstreams`                        | []string | required      | Absolute `http`/`https` URLs, load-balanced round-robin.                   |
 | `strip_prefix`                     | bool     | `false`       | Remove `path_prefix` before forwarding (`/api/users` → `/users`).          |
+| `require_api_key`                  | bool     | `false`       | Reject requests without a valid `X-API-Key` with `401`. Needs `api_keys`.   |
 | `timeout`                          | duration | `30s`         | End-to-end deadline per request; exceeded → `504`.                          |
 | `rate_limit`                       | object   | none          | Omit to disable rate limiting on this route.                                |
 | `rate_limit.rps`                   | number   | required      | Sustained requests per second per client key.                               |
@@ -192,10 +206,14 @@ echo1
 echo2
 
 # Burst past the limit and get told when to come back
-$ for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' localhost:8080/echo/ -H 'X-API-Key: demo'; done
+$ for i in $(seq 1 12); do curl -s -o /dev/null -w '%{http_code} ' localhost:8080/echo/ -H 'X-API-Key: demo-key-0123456789'; done
 200 200 200 200 200 200 200 200 200 200 429 429
-$ curl -s -i localhost:8080/echo/ -H 'X-API-Key: demo' | grep -i retry
+$ curl -s -i localhost:8080/echo/ -H 'X-API-Key: demo-key-0123456789' | grep -i retry
 Retry-After: 1
+
+# An invented key is rejected instead of getting its own fresh bucket
+$ curl -s -o /dev/null -w '%{http_code}\n' localhost:8080/echo/ -H 'X-API-Key: made-up-key-123456'
+401
 
 # Trip a breaker: ask echo to return 500 three times, then watch the gauge
 $ for i in 1 2 3 4 5 6; do curl -s -o /dev/null -w '%{http_code}\n' 'localhost:8080/echo/?status=500'; done
@@ -238,10 +256,18 @@ Metrics exposed on `/metrics`:
 - **Half-open admits a single probe.** Rather than letting a burst of traffic
   hit a recovering upstream, exactly one in-flight request decides whether
   the circuit closes again.
-- **Rate-limit key = API key, else IP.** The gateway trusts only what it can
-  see; `X-Forwarded-For` from clients is not honoured as a key because it is
-  trivially spoofable. Put gatekeeper behind a trusted TLS terminator if you
-  need forwarded IPs, and extend `proxy.ClientKey`.
+- **API keys are verified, never trusted blindly.** A naive limiter that
+  buckets by whatever `X-API-Key` the client sends is trivially bypassed:
+  send a new random key with every request and you get a fresh bucket each
+  time. Gatekeeper only honours keys listed in `api_keys`; unknown keys get
+  `401`, and with no keys configured the header is ignored and the client IP
+  is used. Keys are looked up by SHA-256 digest so lookup time does not leak
+  how much of a guessed key is right, and the secret is stripped before
+  forwarding, replaced by a verified `X-Gatekeeper-Client: <name>` header
+  (any client-supplied copy of that header is removed first).
+- **Client IP from the connection only.** `X-Forwarded-For` is not honoured
+  because it is trivially spoofable. Put gatekeeper behind a trusted TLS
+  terminator if you need forwarded IPs, and extend `proxy.clientIP`.
 - **Hot reload via `atomic.Pointer[Router]`.** A new router is built from the
   file and swapped in atomically; a bad config is rejected with `400` and the
   old router keeps serving. In-flight requests finish on the router they
@@ -268,7 +294,7 @@ make docker # build the container image
 - Additional balancing strategies: least-connections, weighted, consistent hash.
 - Retries with budget for idempotent methods.
 - Request/response header rewriting rules per route.
-- Pluggable auth (JWT validation, API-key allowlists).
+- JWT validation as a second auth mode alongside API keys.
 - Config file watching (fsnotify-free polling) as an alternative to `POST /admin/reload`.
 - Per-route access logs and sampling.
 

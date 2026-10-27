@@ -26,9 +26,18 @@ import (
 	"github.com/sumit-do/gatekeeper/internal/middleware"
 )
 
+// version is stamped at build time with -ldflags "-X main.version=v1.2.3".
+var version = "dev"
+
 func main() {
 	configPath := flag.String("config", "gatekeeper.json", "path to the JSON configuration file")
+	showVersion := flag.Bool("version", false, "print the version and exit")
 	flag.Parse()
+
+	if *showVersion {
+		fmt.Println("gatekeeper", version)
+		return
+	}
 
 	ctx, stop := signal.NotifyContext(context.Background(), os.Interrupt, syscall.SIGTERM)
 	defer stop()
