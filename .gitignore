@@ -1,0 +1,20 @@
+# Build output
+/bin/
+/dist/
+*.exe
+*.test
+*.out
+
+# Coverage and profiling
+coverage.*
+*.prof
+
+# Editor / OS noise
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
+
+# Local overrides
+.env
+gatekeeper.local.json

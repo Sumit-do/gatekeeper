@@ -1,0 +1,28 @@
+services:
+  gateway:
+    build: .
+    command: ["-config", "/etc/gatekeeper/gatekeeper.json"]
+    volumes:
+      - ./examples/compose/gatekeeper.json:/etc/gatekeeper/gatekeeper.json:ro
+    ports:
+      - "8080:8080"
+      - "9090:9090"
+    depends_on:
+      - echo1
+      - echo2
+
+  echo1:
+    build:
+      context: .
+      dockerfile: examples/echo/Dockerfile
+    environment:
+      ECHO_NAME: echo1
+      ECHO_ADDR: ":8081"
+
+  echo2:
+    build:
+      context: .
+      dockerfile: examples/echo/Dockerfile
+    environment:
+      ECHO_NAME: echo2
+      ECHO_ADDR: ":8081"
